@@ -117,6 +117,7 @@ pub mod meta;
 )]
 pub mod pixeldata;
 pub mod tokens;
+pub mod fileset;
 
 mod util;
 
