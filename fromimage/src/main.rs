@@ -12,15 +12,17 @@
 //! encoded in Explicit VR Little Endian.
 //!
 //! [1]: https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.7.6.3.html
+
 use std::path::PathBuf;
 
+use clap::Parser;
 use dicom_core::{value::PrimitiveValue, DataElement, VR};
 use dicom_dictionary_std::tags;
 use dicom_object::{open_file, FileMetaTableBuilder};
-use structopt::StructOpt;
 
 /// Convert and replace a DICOM file's image with another image
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
+#[command(version)]
 struct App {
     /// Path to the base DICOM file to read
     dcm_file: PathBuf,
@@ -28,10 +30,13 @@ struct App {
     img_file: PathBuf,
     /// Path to the output image
     /// (default is to replace input extension with `.new.dcm`)
-    #[structopt(short = "o", long = "out")]
+    #[arg(short = 'o', long = "out")]
     output: Option<PathBuf>,
+    /// Retain the implementation class UID and version name from base DICOM
+    #[arg(long)]
+    retain_implementation: bool,
     /// Print more information about the image and the output file
-    #[structopt(short = "v", long = "verbose")]
+    #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 }
 
@@ -45,8 +50,9 @@ fn main() {
         dcm_file,
         img_file,
         output,
+        retain_implementation,
         verbose,
-    } = App::from_args();
+    } = App::parse();
 
     let output = output.unwrap_or_else(|| {
         let mut path = dcm_file.clone();
@@ -175,13 +181,27 @@ fn main() {
 
     let class_uid = obj.meta().media_storage_sop_class_uid.clone();
 
+    let mut meta_builder = FileMetaTableBuilder::new()
+        // currently the tool will always decode the image's pixel data,
+        // so encode it as Explicit VR Little Endian
+        .transfer_syntax("1.2.840.10008.1.2.1")
+        .media_storage_sop_class_uid(class_uid);
+
+    // recover implementation class UID and version name from base object
+    if retain_implementation {
+        let implementation_class_uid = &obj.meta().implementation_class_uid;
+        meta_builder = meta_builder
+            .implementation_class_uid(implementation_class_uid);
+        
+        if let Some(implementation_version_name) = obj.meta().implementation_version_name.as_ref() {
+            meta_builder = meta_builder
+                .implementation_version_name(implementation_version_name);
+        }
+    }
+
     let obj = obj
         .into_inner()
-        .with_meta(
-            FileMetaTableBuilder::new()
-                .transfer_syntax("1.2.840.10008.1.2.1")
-                .media_storage_sop_class_uid(class_uid),
-        )
+        .with_meta(meta_builder)
         .unwrap_or_else(|e| {
             tracing::error!("{}", snafu::Report::from_error(e));
             std::process::exit(-3);
@@ -194,5 +214,16 @@ fn main() {
 
     if verbose {
         println!("DICOM file saved to {}", output.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::App;
+    use clap::CommandFactory;
+
+    #[test]
+    fn verify_cli() {
+        App::command().debug_assert();
     }
 }

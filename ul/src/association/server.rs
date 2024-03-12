@@ -8,15 +8,15 @@ use std::{borrow::Cow, io::Write, net::TcpStream};
 
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
-use snafu::{ensure, ResultExt, Snafu};
+use snafu::{ensure, Backtrace, ResultExt, Snafu};
 
 use crate::{
     pdu::{
         reader::{read_pdu, DEFAULT_MAX_PDU, MAXIMUM_PDU_SIZE},
         writer::write_pdu,
-        AbortRQServiceProviderReason, AbortRQSource, AssociationRJResult,
-        AssociationRJServiceUserReason, AssociationRJSource, Pdu, PresentationContextResult,
-        PresentationContextResultReason, UserVariableItem,
+        AbortRQServiceProviderReason, AbortRQSource, AssociationAC, AssociationRJ,
+        AssociationRJResult, AssociationRJServiceUserReason, AssociationRJSource, AssociationRQ,
+        Pdu, PresentationContextResult, PresentationContextResultReason, UserVariableItem,
     },
     IMPLEMENTATION_CLASS_UID, IMPLEMENTATION_VERSION_NAME,
 };
@@ -30,49 +30,64 @@ use super::{
 #[non_exhaustive]
 pub enum Error {
     /// missing at least one abstract syntax to accept negotiations
-    MissingAbstractSyntax,
+    MissingAbstractSyntax { backtrace: Backtrace },
 
     /// failed to receive association request
-    ReceiveRequest { source: crate::pdu::reader::Error },
+    ReceiveRequest {
+        #[snafu(backtrace)]
+        source: crate::pdu::reader::Error,
+    },
 
     /// failed to send association response
-    SendResponse { source: crate::pdu::writer::Error },
+    SendResponse {
+        #[snafu(backtrace)]
+        source: crate::pdu::writer::Error,
+    },
 
     /// failed to prepare PDU
-    Send { source: crate::pdu::writer::Error },
+    Send {
+        #[snafu(backtrace)]
+        source: crate::pdu::writer::Error,
+    },
 
     /// failed to send PDU over the wire
-    WireSend { source: std::io::Error },
+    WireSend {
+        source: std::io::Error,
+        backtrace: Backtrace,
+    },
 
     /// failed to receive PDU
-    Receive { source: crate::pdu::reader::Error },
+    Receive {
+        #[snafu(backtrace)]
+        source: crate::pdu::reader::Error,
+    },
 
     #[snafu(display("unexpected request from SCU `{:?}`", pdu))]
     #[non_exhaustive]
     UnexpectedRequest {
         /// the PDU obtained from the server
-        pdu: Pdu,
+        pdu: Box<Pdu>,
     },
 
     #[snafu(display("unknown request from SCU `{:?}`", pdu))]
     #[non_exhaustive]
     UnknownRequest {
         /// the PDU obtained from the server, of variant Unknown
-        pdu: Pdu,
+        pdu: Box<Pdu>,
     },
 
     /// association rejected
-    Rejected,
+    Rejected { backtrace: Backtrace },
 
     /// association aborted
-    Aborted,
+    Aborted { backtrace: Backtrace },
 
     #[snafu(display(
         "PDU is too large ({} bytes) to be sent to the remote application entity",
         length
     ))]
     #[non_exhaustive]
-    SendTooLongPdu { length: usize },
+    SendTooLongPdu { length: usize, backtrace: Backtrace },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -159,7 +174,9 @@ impl AccessControl for AcceptCalledAeTitle {
 /// ```
 ///
 /// The SCP will by default accept all transfer syntaxes
-/// supported by the main [transfer syntax registry][1].
+/// supported by the main [transfer syntax registry][1],
+/// unless one or more transfer syntaxes are explicitly indicated
+/// through calls to [`with_transfer_syntax`][2].
 ///
 /// Access control logic is also available,
 /// enabling application entities to decide on
@@ -179,6 +196,7 @@ impl AccessControl for AcceptCalledAeTitle {
 /// [`AccessControl`]: AccessControl
 ///
 /// [1]: dicom_transfer_syntax_registry
+/// [2]: ServerAssociationOptions::with_transfer_syntax
 #[derive(Debug, Clone)]
 pub struct ServerAssociationOptions<'a, A> {
     /// the application entity access control policy
@@ -332,23 +350,23 @@ where
             read_pdu(&mut socket, max_pdu_length, self.strict).context(ReceiveRequestSnafu)?;
         let mut buffer: Vec<u8> = Vec::with_capacity(max_pdu_length as usize);
         match pdu {
-            Pdu::AssociationRQ {
+            Pdu::AssociationRQ(AssociationRQ {
                 protocol_version,
                 calling_ae_title,
                 called_ae_title,
                 application_context_name,
                 presentation_contexts,
                 user_variables,
-            } => {
+            }) => {
                 if protocol_version != self.protocol_version {
                     write_pdu(
                         &mut buffer,
-                        &Pdu::AssociationRJ {
+                        &Pdu::AssociationRJ(AssociationRJ {
                             result: AssociationRJResult::Permanent,
                             source: AssociationRJSource::ServiceUser(
                                 AssociationRJServiceUserReason::NoReasonGiven,
                             ),
-                        },
+                        }),
                     )
                     .context(SendResponseSnafu)?;
                     socket.write_all(&buffer).context(WireSendSnafu)?;
@@ -358,12 +376,12 @@ where
                 if application_context_name != self.application_context_name {
                     write_pdu(
                         &mut buffer,
-                        &Pdu::AssociationRJ {
+                        &Pdu::AssociationRJ(AssociationRJ {
                             result: AssociationRJResult::Permanent,
                             source: AssociationRJSource::ServiceUser(
                                 AssociationRJServiceUserReason::ApplicationContextNameNotSupported,
                             ),
-                        },
+                        }),
                     )
                     .context(SendResponseSnafu)?;
                     socket.write_all(&buffer).context(WireSendSnafu)?;
@@ -376,10 +394,10 @@ where
                     .unwrap_or_else(|reason| {
                         write_pdu(
                             &mut buffer,
-                            &Pdu::AssociationRJ {
+                            &Pdu::AssociationRJ(AssociationRJ {
                                 result: AssociationRJResult::Permanent,
                                 source: AssociationRJSource::ServiceUser(reason),
-                            },
+                            }),
                         )
                         .context(SendResponseSnafu)?;
                         socket.write_all(&buffer).context(WireSendSnafu)?;
@@ -416,12 +434,14 @@ where
                             };
                         }
 
-                        let mut reason = PresentationContextResultReason::Acceptance;
-                        let transfer_syntax = choose_supported(pc.transfer_syntaxes)
+                        let (transfer_syntax, reason) = self
+                            .choose_ts(pc.transfer_syntaxes)
+                            .map(|ts| (ts, PresentationContextResultReason::Acceptance))
                             .unwrap_or_else(|| {
-                                reason =
-                                    PresentationContextResultReason::TransferSyntaxesNotSupported;
-                                "1.2.840.10008.1.2".to_string()
+                                (
+                                    "1.2.840.10008.1.2".to_string(),
+                                    PresentationContextResultReason::TransferSyntaxesNotSupported,
+                                )
                             });
 
                         PresentationContextResult {
@@ -434,7 +454,7 @@ where
 
                 write_pdu(
                     &mut buffer,
-                    &Pdu::AssociationAC {
+                    &Pdu::AssociationAC(AssociationAC {
                         protocol_version: self.protocol_version,
                         application_context_name,
                         presentation_contexts: presentation_contexts.clone(),
@@ -449,7 +469,7 @@ where
                                 IMPLEMENTATION_VERSION_NAME.to_string(),
                             ),
                         ],
-                    },
+                    }),
                 )
                 .context(SendResponseSnafu)?;
                 socket.write_all(&buffer).context(WireSendSnafu)?;
@@ -476,6 +496,32 @@ where
             | pdu @ Pdu::AbortRQ { .. } => UnexpectedRequestSnafu { pdu }.fail(),
             pdu @ Pdu::Unknown { .. } => UnknownRequestSnafu { pdu }.fail(),
         }
+    }
+
+    /// From a sequence of transfer syntaxes,
+    /// choose the first transfer syntax to
+    /// - be on the options' list of transfer syntaxes, and
+    /// - be supported by the main transfer syntax registry.
+    ///
+    /// If the options' list is empty,
+    /// accept the first transfer syntax supported.
+    fn choose_ts<I, T>(&self, it: I) -> Option<T>
+    where
+        I: IntoIterator<Item = T>,
+        T: AsRef<str>,
+    {
+        if self.transfer_syntax_uids.is_empty() {
+            return choose_supported(it);
+        }
+
+        it.into_iter().find(|ts| {
+            let ts = ts.as_ref();
+            if self.transfer_syntax_uids.is_empty() {
+                ts.trim_end_matches(|c: char| c.is_whitespace() || c == '\0') == "1.2.840.10008.1.2"
+            } else {
+                self.transfer_syntax_uids.contains(&trim_uid(ts.into())) && is_supported(ts)
+            }
+        })
     }
 }
 
@@ -543,7 +589,7 @@ impl ServerAssociation {
     pub fn abort(mut self) -> Result<()> {
         let pdu = Pdu::AbortRQ {
             source: AbortRQSource::ServiceProvider(
-                AbortRQServiceProviderReason::ReasonNotSpecifiedUnrecognizedPdu,
+                AbortRQServiceProviderReason::ReasonNotSpecified,
             ),
         };
         let out = self.send(&pdu);
@@ -601,7 +647,10 @@ pub fn is_supported_with_repo<R>(ts_repo: R, ts_uid: &str) -> bool
 where
     R: TransferSyntaxIndex,
 {
-    ts_repo.get(ts_uid).filter(|ts| !ts.unsupported()).is_some()
+    ts_repo
+        .get(ts_uid)
+        .filter(|ts| !ts.is_unsupported())
+        .is_some()
 }
 
 /// Check that the main transfer syntax registry

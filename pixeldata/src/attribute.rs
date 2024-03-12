@@ -51,8 +51,8 @@ pub enum GetAttributeError {
     Retrieve {
         name: AttributeName,
         #[snafu(backtrace)]
-        #[snafu(source(from(dicom_object::Error, Box::from)))]
-        source: Box<dicom_object::Error>,
+        #[snafu(source(from(dicom_object::AccessError, Box::from)))]
+        source: Box<dicom_object::AccessError>,
     },
 
     #[snafu(display("Could not get attribute `{}`", name))]
@@ -491,7 +491,7 @@ pub fn photometric_interpretation<D: DataDictionary + Clone>(
         .context(MissingRequiredSnafu { name })?
         .string()
         .context(CastValueSnafu { name })?
-        .trim()
+        .trim_matches(|c: char| c.is_whitespace() || c == '\0')
         .into())
 }
 
